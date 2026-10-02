@@ -14,7 +14,8 @@ Paste this file to a Claude Code agent, or point it here, to rebuild, port or ex
 > 2. At `expiresAt - lead` (lead default 30 s), if fewer than `maxPings` (default 3) pings have been sent, send a keep-alive ping with `$.model.fork({ prompt })`. That is one tool-less request over the session's own transcript, so the API serves the prefix from cache and the cache TTL restarts. On success, `pings += 1` and `expiresAt = sentAt + TTL`.
 > 3. Once all pings are spent, at the next `expiresAt - lead` (still before the last window lapses, so the summariser reads a warm cache) call `$.session.compact()`. Then go **dormant**: start a fresh countdown for display, but never ping or compact again.
 > 4. Only real activity leaves dormant and re-arms the cycle: a `prompt.submit` whose `origin.kind !== 'plugin'`, or a main `turn.start`. The person's own `/compact` (`session.compact` with `trigger: 'manual'`) also goes to dormant. Compacting a compacted context again is how context gets lost.
-> 5. **Hold** the compaction (and ping instead, at most 6 extra) while the prompt box holds a draft (`$.prompt.read()`) or an agent is running (`$.agent.list()`).
+> 5. **Hold** the compaction (and ping instead, at most 6 extra) while the prompt box holds a draft (`$.prompt.read()`), an agent is running (`$.agent.list()`), or the last main `classic.Stop` listed `background_tasks` (shells too; each one's end wakes the session, and that turn's Stop refreshes the count).
+> 5b. **Jitter:** each window acts a random `0..min(jitterSeconds, TTL/10)` earlier than `expiresAt - lead`. Draw it when the window starts (turn end, successful ping) and keep it in state, so the due time doesn't move between ticks.
 > 6. **Go cold, never spend** when the cache has already lapsed (`now >= expiresAt`, e.g. the machine slept), when a ping reports `cache_read_input_tokens` of 0 or less than `cache_creation_input_tokens` (the prefix was re-written: `/model`, lapse), or when pings fail until expiry. Retry a failed ping after 10 s while the window lasts. Never retry a failed compaction.
 > 7. Ignore the plugin's own requests. Keep a `selfBusy` counter around fork and compact, skip `turn.start` while it is non-zero unless a real `prompt.submit` just armed `expectTurn`, and accept `turn.complete` only for the main loop (`agentId === undefined`) whose `turnId` was recorded at a real `turn.start`. Subagent turns never reset the timer: they use their own transcript.
 >
@@ -23,7 +24,7 @@ Paste this file to a Claude Code agent, or point it here, to rebuild, port or ex
 > - Row 1: `Cache Keeper <state title>  idle <duration>`
 > - Row 2: `ping ●●○ 2/3 → compact ○  next <action> in <seconds>  · cache lapses in <duration>`. The countdown is green above 60 s, yellow at 60 s or less, red at 15 s or less.
 > - Row 3: a `█░` bar plus `NN% of the idle run to auto-compact`.
-> - Row 4: `TTL 1h (auto) · opus-5-5 · context 305k · ping ≈ $0.06 · cold rebuild ≈ $2.44 (2× write)`. A ping costs context × the model's cache-read rate. A rebuild costs context × input × 1.25 (5m) or 2 (1h). Optional last row: a yellow note such as `compact held: draft typed`.
+> - Row 4: `TTL 1h (auto) · opus-5-5 · context 305k · ping ≈ $0.06 · cold rebuild ≈ $2.44 (2× write)`. A ping costs context × the model's cache-read rate. A rebuild costs context × input × 1.25 (5m) or 2 (1h). Row 5: `cache hit 99.8% last request · 98.6% this session (119 requests)`. Over the whole transcript, count each response once: Claude Code writes one API response as several rows sharing `message.id`. Skip sidechain rows. A yellow `⚠ cache rebuilt by the last request: read X / wrote Y (≈ $)` appears when the previous prompt was at least 20k tokens and the last request read under half of it while writing at least half. Not after a `compact_boundary` row, where the rebuild is expected. Optional last row: a yellow note such as `compact held: draft typed`.
 > - Other states: `working <t>`, `pinging…`, `compacting…`, `compacted · waiting for you, no more pings`, `cache cold · …`, `off`.
 > - Respect `e.props.maxRows`, size to `e.props.bodyColumns`, and return `next(e)` when `hasSurvey` is set or there is nothing to show.
 > - A `display` option of `band`, `status` (`$.ui.status` one-liner) or `both`.
@@ -96,5 +97,4 @@ Then load it live with `claude --plugin-dir plugins/cache-keeper` and set `ttlSe
 
 ## Ideas not built yet
 
-- Hold the compaction on `classic.Stop`'s `background_tasks` (it lists running background Bash too).
 - Show the estimated money saved per idle stretch, using `usage` from the pings and the turn before.

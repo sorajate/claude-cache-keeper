@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 // No ttlSeconds: the TTL comes from the transcript.
-const AUTO = { options: { leadSeconds: 30, maxPings: 3, display: 'both' }, timeoutMs: 60_000 }
+const AUTO = { options: { leadSeconds: 30, jitterSeconds: 0, maxPings: 3, display: 'both' }, timeoutMs: 60_000 }
 
 const START = { cwd: '/w', surface: 'terminal', isInteractive: true } as const
 const TRANSCRIPT = '/home/u/.claude/projects/w/s.jsonl'

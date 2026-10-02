@@ -11,6 +11,7 @@ Cache Keeper idle · keeping the cache warm  idle 2m 15s
 ping ●○○ 1/3 → compact ○  next ping 2/3 in 42s  · cache lapses in 1m 12s
 ███████░░░░░░░░░░░░░░░░░░░░░░░░░ 22% of the idle run to auto-compact
 TTL 1h (auto) · opus-5-5 · context 305k · ping ≈ $0.06 · cold rebuild ≈ $2.44 (2× write)
+cache hit 99.8% last request · 98.6% this session (119 requests)
 ```
 
 ## 5 minutes or 1 hour: what it costs
@@ -42,7 +43,9 @@ turn ends  → cache 5:00, idle starts
 ```
 
 - **Never compacts twice.** After the idle compaction, or your own `/compact`, it goes dormant. Only your next prompt or turn re-arms it, so a long absence can't summarise the context away.
-- **Holds compaction** while you have a draft typed in the prompt box or background agents are running. It keeps pinging instead, up to 6 more times.
+- **Holds compaction** while you have a draft typed in the prompt box, an agent is running, or background tasks (shells included) were still in flight when the last turn stopped. It keeps pinging instead, up to 6 more times.
+- **Shows your cache hit rate**, for the last request and for the whole session. Each API response is counted once, though Claude Code writes one response over several transcript rows. A cache collapse heals by the next turn, so it is easy to miss. When a request reads back less than half of the prompt before it and writes the rest anew, the band warns, with what that cost: `⚠ cache rebuilt by the last request: read 0 / wrote 203k (≈ $1.62)`. The rebuild right after a compaction is expected and not flagged.
+- **Pings slightly off the beat:** each window acts a random 0–20 s earlier (at most 10% of the TTL), never later.
 - **Stops when pinging is pointless.** If the cache has already lapsed (laptop asleep, `/model` switched) or pings keep failing, it shows `cache cold` and does nothing. A ping then would only pay for a full re-cache.
 - **Ignores its own requests**, so pings and compactions never re-arm the timer. Subagent turns don't reset it either: they use their own transcript, not the main thread's cache.
 
@@ -86,6 +89,7 @@ Settings live under `/config` → cache-keeper, or `/plugin configure cache-keep
 | --- | --- | --- |
 | `ttlSeconds` | `0` | `0` detects the TTL from the session. Any other value forces that many seconds. |
 | `leadSeconds` | `30` | How long before the cache lapses to ping or compact |
+| `jitterSeconds` | `20` | Act up to this much earlier still, at random (capped at 10% of the TTL; `0` for exact timing) |
 | `maxPings` | `3` | Pings per idle stretch before compacting |
 | `compactInstructions` | empty | What the idle compaction's summary should keep |
 | `display` | `band` | `band` (above the prompt), `status` (one line), or `both` |
@@ -99,7 +103,6 @@ Tip: set `ttlSeconds` to `60` for a few minutes to watch a whole cycle quickly, 
 - The countdown after a compaction is for information only. The compacted conversation is cached by your next request.
 - TTL detection reads the session transcript after each turn (skipped past 64 MB). If the plugin can't read it, the band shows `TTL 5m (assumed)` and the reason.
 - Prices are a built-in table of first-party list prices. An unknown model shows multipliers instead of dollars.
-- Known gap: a long-running background **Bash** task (not an agent) does not hold the compaction yet.
 
 ## Develop
 

@@ -1,6 +1,6 @@
 {
   "name": "cache-keeper",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Shows when the prompt cache lapses, keeps it warm with a few pings while idle, then compacts once and waits",
   "author": {
     "name": "sorajate",
@@ -28,6 +28,12 @@
       "title": "Ping lead (seconds)",
       "description": "How long before the cache lapses to send the keep-alive ping or the compaction",
       "default": 30
+    },
+    "jitterSeconds": {
+      "type": "number",
+      "title": "Ping jitter (seconds)",
+      "description": "Act up to this much earlier, at random, so pings do not land on an exact beat (capped at 10% of the TTL)",
+      "default": 20
     },
     "maxPings": {
       "type": "number",

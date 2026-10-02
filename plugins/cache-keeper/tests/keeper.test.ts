@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 // 60 s TTL, act 10 s before it lapses: one action every 50 s, compaction at 200 s.
-const OPTIONS = { ttlSeconds: 60, leadSeconds: 10, maxPings: 3, display: 'both' }
+const OPTIONS = { ttlSeconds: 60, leadSeconds: 10, jitterSeconds: 0, maxPings: 3, display: 'both' }
 const SLOW = { options: OPTIONS, timeoutMs: 60_000 }
 
 const HIT = {

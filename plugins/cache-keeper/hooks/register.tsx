@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { CacheInfo, CacheTtl, KeeperState } from '../types'
+import type { CacheInfo, CacheRebuild, CacheTtl, KeeperState } from '../types'
 
 type $ = EngineInterface
 type CompactResult = Awaited<ReturnType<$['session']['compact']>>
@@ -31,8 +31,10 @@ const INITIAL: KeeperState = {
   note: '',
   idleSince: 0,
   activeSince: 0,
-  cache: { ttl: '', model: '', contextTokens: 0, detail: '' },
+  cache: { ttl: '', model: '', contextTokens: 0, detail: '', hitLast: -1, hitSession: -1, requests: 0, rebuild: null },
   transcriptPath: '',
+  backgroundTasks: 0,
+  jitterMs: 0,
 }
 
 const keeper = atom({ plugin: 'cache-keeper', key: 'keeper' } as const, INITIAL)
@@ -45,6 +47,7 @@ const config = {
   leadMs: 30_000,
   overrideTtlMs: 0,
   leadSettingMs: 30_000,
+  jitterSettingMs: 20_000,
   maxPings: 3,
   instructions: '',
   hasBand: true,
@@ -63,6 +66,8 @@ function positive(value: unknown, fallback: number) {
 function configure(options: PluginOptions) {
   config.overrideTtlMs = positive(options.ttlSeconds, 0) * 1000
   config.leadSettingMs = positive(options.leadSeconds, 30) * 1000
+  const jitter = options.jitterSeconds
+  config.jitterSettingMs = typeof jitter === 'number' && jitter >= 0 ? jitter * 1000 : 20_000
   useTtl(config.overrideTtlMs || DEFAULT_TTL_MS)
   config.maxPings = Math.floor(positive(options.maxPings, 3))
   const text = options.compactInstructions
@@ -75,6 +80,16 @@ function configure(options: PluginOptions) {
 function useTtl(ms: number) {
   config.ttlMs = ms
   config.leadMs = Math.min(config.leadSettingMs, ms / 2)
+}
+
+// A fresh random head start for the next window: pings off an exact beat.
+function drawJitter() {
+  return Math.random() * Math.min(config.jitterSettingMs, config.ttlMs / 10)
+}
+
+// When this window's ping or compaction is due.
+function actAt(s: KeeperState) {
+  return Math.max(s.expiresAt - config.leadMs - s.jitterMs, s.retryAt)
 }
 
 // The effective TTL for what the transcript showed, unless the person forced one.
@@ -92,6 +107,7 @@ type UsageRow = {
   type?: string
   isSidechain?: boolean
   message?: {
+    id?: string
     model?: string
     usage?: {
       input_tokens?: number
@@ -102,17 +118,35 @@ type UsageRow = {
   }
 }
 
-// Reads the newest main-thread responses of a session transcript: the model and
-// context size of the last one, and the TTL of the latest one that wrote cache.
-// A response that wrote any 5-minute entry counts as 5m: its tail lapses first.
+type Request = {
+  model: string
+  read: number
+  wrote: number
+  uncached: number
+  ttl: CacheTtl | ''
+  // A compaction came between this request and the one before: its rebuild is expected.
+  isAfterCompaction: boolean
+}
+
+// A rebuild worth a warning: the previous prompt was sizeable, this one read back
+// less than half of it and wrote at least that much anew.
+const REBUILD_MIN_TOKENS = 20_000
+
+function promptOf(request: Request) {
+  return request.read + request.wrote + request.uncached
+}
+
+// Reads a session transcript's main-thread responses, one per API response
+// (Claude Code splits a response over several rows that share its message id):
+// the last one's model and context, the TTL of the latest that wrote cache (any
+// 5-minute write counts as 5m: its tail lapses first), and the hit rates.
 export function sampleTranscript(text: string): CacheInfo | undefined {
-  const lines = text.split('\n')
-  let found: CacheInfo | undefined
-  let seen = 0
-  for (let i = lines.length - 1; i >= 0 && seen < 400; i -= 1) {
-    const line = lines[i] ?? ''
+  const requests: Request[] = []
+  const seen = new Set<string>()
+  let isAfterCompaction = false
+  for (const line of text.split('\n')) {
+    if (line.includes('"compact_boundary"')) isAfterCompaction = true
     if (!line.includes('"usage"')) continue
-    seen += 1
     let row: UsageRow
     try {
       row = JSON.parse(line) as UsageRow
@@ -121,16 +155,47 @@ export function sampleTranscript(text: string): CacheInfo | undefined {
     }
     const usage = row.message?.usage
     if (row.type !== 'assistant' || row.isSidechain === true || usage === undefined) continue
-    if (found === undefined) {
-      const context =
-        (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
-      found = { ttl: '', model: row.message?.model ?? '', contextTokens: context, detail: '' }
-    }
-    const written = usage.cache_creation
-    if ((written?.ephemeral_5m_input_tokens ?? 0) > 0) return { ...found, ttl: '5m' }
-    if ((written?.ephemeral_1h_input_tokens ?? 0) > 0) return { ...found, ttl: '1h' }
+    const read = usage.cache_read_input_tokens ?? 0
+    const wrote = usage.cache_creation_input_tokens ?? 0
+    const uncached = usage.input_tokens ?? 0
+    const id = row.message?.id ?? `${read}/${wrote}/${uncached}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    const split = usage.cache_creation
+    const ttl = (split?.ephemeral_5m_input_tokens ?? 0) > 0 ? '5m' : (split?.ephemeral_1h_input_tokens ?? 0) > 0 ? '1h' : ''
+    requests.push({ model: row.message?.model ?? '', read, wrote, uncached, ttl, isAfterCompaction })
+    isAfterCompaction = false
   }
-  return found
+
+  const last = requests.at(-1)
+  if (last === undefined) return undefined
+  let read = 0
+  let total = 0
+  let ttl: CacheTtl | '' = ''
+  for (const request of requests) {
+    read += request.read
+    total += promptOf(request)
+    if (request.ttl !== '') ttl = request.ttl
+  }
+  const previous = requests.at(-2)
+  const isRebuild =
+    previous !== undefined &&
+    !last.isAfterCompaction &&
+    promptOf(previous) >= REBUILD_MIN_TOKENS &&
+    last.read < promptOf(previous) / 2 &&
+    last.wrote >= promptOf(previous) / 2
+  const rebuild: CacheRebuild | null = isRebuild ? { read: last.read, wrote: last.wrote } : null
+  const context = promptOf(last)
+  return {
+    ttl,
+    model: last.model,
+    contextTokens: context,
+    detail: '',
+    hitLast: context > 0 ? last.read / context : -1,
+    hitSession: total > 0 ? read / total : -1,
+    requests: requests.length,
+    rebuild,
+  }
 }
 
 type Rate = { input: number; read: number }
@@ -165,6 +230,25 @@ function dollars(amount: number) {
 
 function thousands(tokens: number) {
   return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens)
+}
+
+function percent(share: number) {
+  return share < 0 ? '-' : `${(share * 100).toFixed(1)}%`
+}
+
+export function hitLine(cache: CacheInfo) {
+  if (cache.requests === 0) return undefined
+  return `cache hit ${percent(cache.hitLast)} last request · ${percent(cache.hitSession)} this session (${cache.requests} requests)`
+}
+
+// The warning for a request that rebuilt the cache, priced as a write at the session's TTL.
+export function rebuildLine(cache: CacheInfo) {
+  if (cache.rebuild === null) return undefined
+  const { read, wrote } = cache.rebuild
+  const rate = rateOf(cache.model)
+  const writeRate = cache.ttl === '1h' ? 2 : 1.25
+  const cost = rate === undefined ? '' : ` (≈ ${dollars((wrote * rate.input * writeRate) / 1e6)})`
+  return `⚠ cache rebuilt by the last request: read ${thousands(read)} / wrote ${thousands(wrote)}${cost}`
 }
 
 // What one keep-alive and one cold rebuild of this context cost, as the band shows them.
@@ -251,6 +335,7 @@ async function markWarm($: $) {
     pings: 0,
     holdPings: 0,
     expiresAt: now + config.ttlMs,
+    jitterMs: drawJitter(),
     retryAt: 0,
     epoch: s.epoch + 1,
     idleSince: now,
@@ -276,11 +361,13 @@ async function markDormant($: $, note: string, isActivity: boolean) {
 }
 
 // Why compaction should wait even though the pings are spent.
-async function holdReason($: $) {
+async function holdReason($: $, s: KeeperState) {
   const box = await $.prompt.read()
   if (box.text.trim() !== '') return 'draft typed'
   const agents = await $.agent.list()
   if (agents.some(agent => agent.status === 'running')) return 'agents running'
+  // Shells and agents in flight at the last stop: each one's end wakes the session.
+  if (s.backgroundTasks > 0) return 'background tasks running'
   return undefined
 }
 
@@ -309,6 +396,7 @@ async function ping($: $, from: KeeperState, hold?: string) {
         pings: isHeld ? s.pings : s.pings + 1,
         holdPings: isHeld ? s.holdPings + 1 : s.holdPings,
         expiresAt: sentAt + config.ttlMs,
+        jitterMs: drawJitter(),
         retryAt: 0,
         note: isHeld ? `compact held: ${hold}` : '',
       }
@@ -353,10 +441,10 @@ async function act($: $, s: KeeperState, now: number) {
     )
     return
   }
-  if (now < s.expiresAt - config.leadMs || now < s.retryAt) return
+  if (now < actAt(s)) return
 
   if (s.pings < config.maxPings) return ping($, s)
-  const hold = await holdReason($)
+  const hold = await holdReason($, s)
   if (hold === undefined) return compact($, s)
   if (s.holdPings < HOLD_PING_CAP) return ping($, s, hold)
   // Held too long: let it lapse rather than ping forever.
@@ -383,7 +471,7 @@ function describe(s: KeeperState, now: number) {
     case 'warm': {
       const { leadMs, ttlMs, maxPings } = config
       const spent = Math.min(s.pings, maxPings)
-      const compactAt = s.expiresAt - leadMs + (maxPings - spent) * (ttlMs - leadMs)
+      const compactAt = actAt(s) + (maxPings - spent) * (ttlMs - leadMs)
       const tail = s.holdPings > 0 ? '' : ` · compact in ${clock(compactAt - now)}`
       const note = s.note === '' ? '' : ` · ${s.note}`
       return `cache ${clock(left)} · ping ${spent}/${maxPings}${tail}${note}`
@@ -418,6 +506,8 @@ type BandView = {
   cache?: string
   progress?: number
   price?: string
+  hits?: string
+  rebuild?: string
   note: string
 }
 
@@ -454,7 +544,7 @@ function bandView(s: KeeperState, now: number): BandView | undefined {
   const note = s.note
   const price =
     s.cache.model === '' ? `${ttlLabel(s.cache)} · ${s.cache.detail || 'checked after the next reply'}` : priceLine(s.cache)
-  const base = { idle, steps: steps(s), note, price }
+  const base = { idle, steps: steps(s), note, price, hits: hitLine(s.cache), rebuild: rebuildLine(s.cache) }
   const cache = s.expiresAt > now ? span(s.expiresAt - now) : 'lapsed'
 
   if (s.isOff) return { ...base, tone: 'gray', title: 'off · /cache-keeper on to resume' }
@@ -472,11 +562,11 @@ function bandView(s: KeeperState, now: number): BandView | undefined {
     case 'dormant':
       return { ...base, tone: 'gray', title: 'compacted · waiting for you, no more pings', cache }
     case 'warm': {
-      const actAt = Math.max(s.expiresAt - leadMs, s.retryAt)
+      const dueAt = actAt(s)
       const spent = Math.min(s.pings, maxPings)
       const isHeld = s.holdPings > 0
       const label = spent < maxPings ? `ping ${spent + 1}/${maxPings}` : isHeld ? 'ping (compact held)' : 'auto-compact'
-      const compactAt = s.expiresAt - leadMs + (maxPings - spent) * (ttlMs - leadMs)
+      const compactAt = dueAt + (maxPings - spent) * (ttlMs - leadMs)
       const fraction = (now - s.idleSince) / Math.max(1, compactAt - s.idleSince)
       const progress =
         isHeld || !known(s.idleSince) || !Number.isFinite(fraction)
@@ -486,7 +576,7 @@ function bandView(s: KeeperState, now: number): BandView | undefined {
         ...base,
         tone: 'green',
         title: 'idle · keeping the cache warm',
-        next: { label, left: span(actAt - now), tone: urgency(actAt - now) },
+        next: { label, left: span(dueAt - now), tone: urgency(dueAt - now) },
         cache,
         progress,
       }
@@ -559,7 +649,10 @@ export const register: Register = (on, options) => {
 
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
-    if (e.agent_id === undefined && e.transcript_path !== '') await detect($, e.transcript_path)
+    if (e.agent_id !== undefined) return result
+    const inFlight = e.background_tasks?.length ?? 0
+    await update($, keeper, (s): KeeperState => ({ ...s, backgroundTasks: inFlight }))
+    if (e.transcript_path !== '') await detect($, e.transcript_path)
     return result
   })
 
@@ -600,6 +693,8 @@ export const register: Register = (on, options) => {
           <Text dimColor wrap="truncate-end">{`${bar(view.progress, width)} ${compactAt}`}</Text>
         )}
         {e.props.maxRows >= 4 && view.price !== undefined && <Text dimColor wrap="truncate-end">{view.price}</Text>}
+        {e.props.maxRows >= 5 && view.hits !== undefined && <Text dimColor wrap="truncate-end">{view.hits}</Text>}
+        {e.props.maxRows >= 3 && view.rebuild !== undefined && <Text color="yellow" wrap="truncate-end">{view.rebuild}</Text>}
         {e.props.maxRows >= 3 && view.note !== '' && <Text color="yellow" wrap="truncate-end">{view.note}</Text>}
       </Box>
     )
@@ -616,7 +711,9 @@ export const register: Register = (on, options) => {
     const s = await read($, keeper)
     const { leadMs, maxPings } = config
     return {
-      text: `${line}\n${priceLine(s.cache)}\n(ping ${leadMs / 1000}s before it lapses, ${maxPings} pings then compact)`,
+      text: [line, priceLine(s.cache), hitLine(s.cache), rebuildLine(s.cache), `(ping ${leadMs / 1000}s before it lapses, ${maxPings} pings then compact)`]
+        .filter(part => part !== undefined)
+        .join('\n'),
     }
   })
 }
