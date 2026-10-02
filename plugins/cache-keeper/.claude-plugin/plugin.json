@@ -1,0 +1,56 @@
+{
+  "name": "cache-keeper",
+  "version": "0.2.1",
+  "description": "Shows when the prompt cache lapses, keeps it warm with a few pings while idle, then compacts once and waits",
+  "author": {
+    "name": "sorajate",
+    "url": "https://github.com/sorajate"
+  },
+  "homepage": "https://github.com/sorajate/claude-cache-keeper",
+  "repository": "https://github.com/sorajate/claude-cache-keeper",
+  "license": "MIT",
+  "keywords": [
+    "prompt-cache",
+    "compact",
+    "status",
+    "cost"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "ttlSeconds": {
+      "type": "number",
+      "title": "Cache TTL (seconds)",
+      "description": "How long the prompt cache lives after a request (Claude Code default: 300)",
+      "default": 300
+    },
+    "leadSeconds": {
+      "type": "number",
+      "title": "Ping lead (seconds)",
+      "description": "How long before the cache lapses to send the keep-alive ping or the compaction",
+      "default": 30
+    },
+    "maxPings": {
+      "type": "number",
+      "title": "Keep-alive pings",
+      "description": "Pings per idle stretch before compacting",
+      "default": 3
+    },
+    "compactInstructions": {
+      "type": "string",
+      "title": "Compact instructions",
+      "description": "What the idle compaction's summary should keep (empty: the engine's own prompt)",
+      "default": ""
+    },
+    "display": {
+      "type": "string",
+      "title": "Display",
+      "description": "Where the keeper shows its state: a bar above the prompt, the one-line status, or both",
+      "options": [
+        "band",
+        "status",
+        "both"
+      ],
+      "default": "band"
+    }
+  }
+}

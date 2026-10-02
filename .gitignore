@@ -1,0 +1,11 @@
+# Written by Claude Code each time it loads the plugin from disk. The MCP typings
+# list the tools of whoever loaded it, so they never belong in the repository.
+.claude-plugin/types/
+plugins/*/.claude-plugin/types/
+
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
