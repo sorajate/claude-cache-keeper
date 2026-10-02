@@ -16,8 +16,24 @@ const HOLD_PING_CAP = 6
 // pinging a 1-hour cache early costs a cheap read, compacting it early costs the context.
 const DEFAULT_TTL_MS = 300_000
 const TTL_MS: Record<CacheTtl, number> = { '5m': 300_000, '1h': 3_600_000 }
-// Transcripts past this size are not re-read; the last detection stands.
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+// $.fs.read rejects past 4 MiB: a longer transcript has only its tail read, by a
+// child process, whose output stays under the same 4 MiB cap.
+const READ_LIMIT_BYTES = 4 * 1024 * 1024
+const TAIL_BYTES = 3 * 1024 * 1024
+// The tail on Windows, where no `tail` ships: the path and size come in through the
+// environment, so nothing of them is ever parsed as script.
+const TAIL_SCRIPT = [
+  '$n = [int64]$env:CACHE_KEEPER_TAIL',
+  "$f = [IO.File]::Open($env:CACHE_KEEPER_PATH, 'Open', 'Read', 'ReadWrite')",
+  'try {',
+  '  $start = [Math]::Max([int64]0, $f.Length - $n)',
+  "  [void]$f.Seek($start, 'Begin')",
+  '  $b = New-Object byte[] ($f.Length - $start)',
+  '  $t = 0',
+  '  while ($t -lt $b.Length) { $k = $f.Read($b, $t, $b.Length - $t); if ($k -le 0) { break }; $t += $k }',
+  '  $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $t); $o.Flush()',
+  '} finally { $f.Close() }',
+].join('\n')
 
 const INITIAL: KeeperState = {
   phase: 'unknown',
@@ -31,7 +47,7 @@ const INITIAL: KeeperState = {
   note: '',
   idleSince: 0,
   activeSince: 0,
-  cache: { ttl: '', model: '', contextTokens: 0, detail: '', hitLast: -1, hitSession: -1, requests: 0, rebuild: null },
+  cache: { ttl: '', model: '', contextTokens: 0, detail: '', hitLast: -1, hitSession: -1, requests: 0, isTail: false, rebuild: null },
   transcriptPath: '',
   backgroundTasks: 0,
   jitterMs: 0,
@@ -194,6 +210,7 @@ export function sampleTranscript(text: string): CacheInfo | undefined {
     hitLast: context > 0 ? last.read / context : -1,
     hitSession: total > 0 ? read / total : -1,
     requests: requests.length,
+    isTail: false,
     rebuild,
   }
 }
@@ -238,7 +255,8 @@ function percent(share: number) {
 
 export function hitLine(cache: CacheInfo) {
   if (cache.requests === 0) return undefined
-  return `cache hit ${percent(cache.hitLast)} last request · ${percent(cache.hitSession)} this session (${cache.requests} requests)`
+  const scope = cache.isTail ? `the last ${cache.requests} requests` : `this session (${cache.requests} requests)`
+  return `cache hit ${percent(cache.hitLast)} last request · ${percent(cache.hitSession)} ${scope}`
 }
 
 // The warning for a request that rebuilt the cache, priced as a write at the session's TTL.
@@ -283,19 +301,33 @@ async function noteDetail($: $, detail: string) {
   )
 }
 
+// The transcript's last TAIL_BYTES, from its first whole line on.
+async function readTail($: $, transcriptPath: string) {
+  const isWindows = /^[A-Za-z]:|\\/.test(transcriptPath)
+  const argv = isWindows
+    ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', TAIL_SCRIPT]
+    : ['tail', '-c', String(TAIL_BYTES), transcriptPath]
+  const env = { CACHE_KEEPER_PATH: transcriptPath, CACHE_KEEPER_TAIL: String(TAIL_BYTES) }
+  const result = await $.process.run(argv, { env, timeoutMs: 15_000 })
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim().split('\n')[0] || `tail exited ${result.exitCode}`)
+  return result.stdout.slice(result.stdout.indexOf('\n') + 1)
+}
+
 async function detect($: $, transcriptPath: string) {
   let text: string
+  let isTail = false
   try {
     const stat = await $.fs.stat(transcriptPath)
     if (stat.kind !== 'file') return noteDetail($, 'checked after the next reply')
-    if (stat.size > MAX_TRANSCRIPT_BYTES) return noteDetail($, 'transcript too large to read')
-    text = await $.fs.read(transcriptPath)
+    isTail = stat.size > READ_LIMIT_BYTES
+    text = isTail ? await readTail($, transcriptPath) : await $.fs.read(transcriptPath)
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error)
-    return noteDetail($, `transcript unreadable: ${reason.slice(0, 80)}`)
+    const reason = (error instanceof Error ? error.message : String(error)).replace(transcriptPath, 'transcript')
+    return noteDetail($, `transcript unreadable: ${reason.slice(0, 100)}`)
   }
-  const cache = sampleTranscript(text)
-  if (cache === undefined) return noteDetail($, 'checked after the next reply')
+  const sampled = sampleTranscript(text)
+  if (sampled === undefined) return noteDetail($, 'checked after the next reply')
+  const cache = { ...sampled, isTail }
   const before = config.ttlMs
   applyCache(cache)
   const after = config.ttlMs

@@ -1,6 +1,6 @@
 {
   "name": "cache-keeper",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Shows when the prompt cache lapses, keeps it warm with a few pings while idle, then compacts once and waits",
   "author": {
     "name": "sorajate",

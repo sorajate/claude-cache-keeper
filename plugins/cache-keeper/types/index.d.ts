@@ -24,6 +24,8 @@ export type CacheInfo = {
   hitSession: number
   /** Main-thread API requests counted (one per response, however many transcript rows it spans). */
   requests: number
+  /** Only the transcript's tail was read (it is past what one read takes): the rate covers those requests. */
+  isTail: boolean
   /** The last request rebuilt most of a prompt the one before had cached; null when it did not. */
   rebuild: CacheRebuild | null
 }

@@ -101,7 +101,7 @@ Tip: set `ttlSeconds` to `60` for a few minutes to watch a whole cycle quickly, 
 - Claude Code with **function-hook plugins** (built and tested on 2.1.287). That plugin API is early access and may change between releases.
 - Each ping is a real API request: it reads the cached context (about 0.1× input price) plus a tiny reply.
 - The countdown after a compaction is for information only. The compacted conversation is cached by your next request.
-- TTL detection reads the session transcript after each turn (skipped past 64 MB). If the plugin can't read it, the band shows `TTL 5m (assumed)` and the reason.
+- TTL detection reads the session transcript after each turn. A plugin can read at most 4 MiB at once, so for a longer transcript the plugin reads its last 3 MiB with `tail`, or with PowerShell on Windows. The hit rate then covers `the last N requests`, not the whole session. If the plugin can't read the transcript, the band shows `TTL 5m (assumed)` and the reason.
 - Prices are a built-in table of first-party list prices. An unknown model shows multipliers instead of dollars.
 
 ## Develop
