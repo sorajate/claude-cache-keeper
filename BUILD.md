@@ -10,7 +10,7 @@ Paste this file to a Claude Code agent, or point it here, to rebuild, port or ex
 >
 > **Behaviour**
 >
-> 1. When a main-thread turn ends, the cache is fresh: set `expiresAt = now + TTL` (TTL default 300 s) and `idleSince = now`, and reset the ping count.
+> 1. When a main-thread turn ends, the cache is fresh: set `expiresAt = now + TTL` and `idleSince = now`, and reset the ping count. **Detect the TTL; don't configure it.** Claude Code chooses 5m or 1h itself. In a `classic.Stop` hook (main thread: `e.agent_id === undefined`), read `e.transcript_path` with `$.fs.read` and walk the newest `assistant` rows that are not sidechains. The first one gives `model` and context (`input + cache_read + cache_creation`), and the newest one with a cache write gives the TTL: any `ephemeral_5m_input_tokens > 0` → 5m, else `ephemeral_1h_input_tokens > 0` → 1h. Assume 5m until a write is seen. If the TTL changed while warm, re-time `expiresAt = idleSince + TTL`. `ttlSeconds > 0` overrides.
 > 2. At `expiresAt - lead` (lead default 30 s), if fewer than `maxPings` (default 3) pings have been sent, send a keep-alive ping with `$.model.fork({ prompt })`. That is one tool-less request over the session's own transcript, so the API serves the prefix from cache and the cache TTL restarts. On success, `pings += 1` and `expiresAt = sentAt + TTL`.
 > 3. Once all pings are spent, at the next `expiresAt - lead` (still before the last window lapses, so the summariser reads a warm cache) call `$.session.compact()`. Then go **dormant**: start a fresh countdown for display, but never ping or compact again.
 > 4. Only real activity leaves dormant and re-arms the cycle: a `prompt.submit` whose `origin.kind !== 'plugin'`, or a main `turn.start`. The person's own `/compact` (`session.compact` with `trigger: 'manual'`) also goes to dormant. Compacting a compacted context again is how context gets lost.
@@ -22,7 +22,8 @@ Paste this file to a Claude Code agent, or point it here, to rebuild, port or ex
 >
 > - Row 1: `Cache Keeper <state title>  idle <duration>`
 > - Row 2: `ping ●●○ 2/3 → compact ○  next <action> in <seconds>  · cache lapses in <duration>`. The countdown is green above 60 s, yellow at 60 s or less, red at 15 s or less.
-> - Row 3: a `█░` bar plus `NN% of the idle run to auto-compact`. Optional row 4: a yellow note such as `compact held: draft typed`.
+> - Row 3: a `█░` bar plus `NN% of the idle run to auto-compact`.
+> - Row 4: `TTL 1h (auto) · opus-5-5 · context 305k · ping ≈ $0.06 · cold rebuild ≈ $2.44 (2× write)`. A ping costs context × the model's cache-read rate. A rebuild costs context × input × 1.25 (5m) or 2 (1h). Optional last row: a yellow note such as `compact held: draft typed`.
 > - Other states: `working <t>`, `pinging…`, `compacting…`, `compacted · waiting for you, no more pings`, `cache cold · …`, `off`.
 > - Respect `e.props.maxRows`, size to `e.props.bodyColumns`, and return `next(e)` when `hasSurvey` is set or there is nothing to show.
 > - A `display` option of `band`, `status` (`$.ui.status` one-liner) or `both`.
@@ -68,6 +69,8 @@ The plugin API is early access, so check each of these against the current `clau
 - **Functions that take `$` must be top-level declarations** (`function x($) {}` or a `const` bound to one). `claude plugin validate` rejects `$` passed to closures defined inside `register`. Keep configuration in a module-level object that `register(on, options)` fills.
 - **`update($, atom, fn)` callbacks need a return-type annotation** (`(s): KeeperState => ({ ...s, phase: 'warm' })`). Otherwise the string-literal union widens to `string` and nothing type-checks.
 - **`$.state` outlives a reload, and so does an older version's shape.** On `session.start`, merge the stored value over the defaults (`{ ...INITIAL, ...saved }`) and treat absent or `NaN` times as unknown. Without this, 0.2.0 drew `NaN%` over 0.1.0's state.
+- **Classic hook events are hookable as `classic.<Event>`.** `classic.Stop` carries `transcript_path` and `background_tasks`. In tests, raise it with `$.classic.Stop({ stop_hook_active: false, transcript_path })` and answer `on('classic.Stop', () => ({}))` beneath. Mock `fs.stat` and `fs.read` as operations (`{ value }`).
+- **The validator treats every name handed `$` as one function.** A local `const ping = …` elsewhere in the file counts as a second declaration of `ping($, …)`.
 - **`$.model.fork`** answers `nothing-to-fork` before the first reply and after `/clear`. Its `usage` (on every arm except that one) tells you whether the cache served the prefix.
 - **`$.session.compact()`** rejects while a turn runs and resolves `{ skip }` when a hook vetoed it.
 - **`$.clock.every(ms, fn)`** started in `session.start` keeps running until reload. `$` captured there stays valid in the callback.
@@ -93,6 +96,5 @@ Then load it live with `claude --plugin-dir plugins/cache-keeper` and set `ttlSe
 
 ## Ideas not built yet
 
-- Hold the compaction while background Bash tasks run, not only agents.
-- Read the session's real cache TTL instead of a configured one, if the API exposes it.
+- Hold the compaction on `classic.Stop`'s `background_tasks` (it lists running background Bash too).
 - Show the estimated money saved per idle stretch, using `usage` from the pings and the turn before.

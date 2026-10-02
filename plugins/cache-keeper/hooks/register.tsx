@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { KeeperState } from '../types'
+import type { CacheInfo, CacheTtl, KeeperState } from '../types'
 
 type $ = EngineInterface
 type CompactResult = Awaited<ReturnType<$['session']['compact']>>
@@ -12,6 +12,12 @@ const TICK_MS = 1000
 const RETRY_MS = 10_000
 // Pings allowed past maxPings while compaction is held (draft typed, agents running).
 const HOLD_PING_CAP = 6
+// Until a cache write shows which TTL the session uses, assume the shorter one:
+// pinging a 1-hour cache early costs a cheap read, compacting it early costs the context.
+const DEFAULT_TTL_MS = 300_000
+const TTL_MS: Record<CacheTtl, number> = { '5m': 300_000, '1h': 3_600_000 }
+// Transcripts past this size are not re-read; the last detection stands.
+const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
 
 const INITIAL: KeeperState = {
   phase: 'unknown',
@@ -25,15 +31,19 @@ const INITIAL: KeeperState = {
   note: '',
   idleSince: 0,
   activeSince: 0,
+  cache: { ttl: '', model: '', contextTokens: 0 },
 }
 
 const keeper = atom({ plugin: 'cache-keeper', key: 'keeper' } as const, INITIAL)
 // Written every tick so the band redraws each second.
 const ticker = atom({ plugin: 'cache-keeper', key: 'now' } as const, 0)
 
+// ttlMs and leadMs are the effective values: the override when set, else what was detected.
 const config = {
-  ttlMs: 300_000,
+  ttlMs: DEFAULT_TTL_MS,
   leadMs: 30_000,
+  overrideTtlMs: 0,
+  leadSettingMs: 30_000,
   maxPings: 3,
   instructions: '',
   hasBand: true,
@@ -50,14 +60,140 @@ function positive(value: unknown, fallback: number) {
 }
 
 function configure(options: PluginOptions) {
-  config.ttlMs = positive(options.ttlSeconds, 300) * 1000
-  config.leadMs = Math.min(positive(options.leadSeconds, 30) * 1000, config.ttlMs / 2)
+  config.overrideTtlMs = positive(options.ttlSeconds, 0) * 1000
+  config.leadSettingMs = positive(options.leadSeconds, 30) * 1000
+  useTtl(config.overrideTtlMs || DEFAULT_TTL_MS)
   config.maxPings = Math.floor(positive(options.maxPings, 3))
   const text = options.compactInstructions
   config.instructions = typeof text === 'string' ? text.trim() : ''
   const display = options.display
   config.hasBand = display !== 'status'
   config.hasStatus = display === 'status' || display === 'both'
+}
+
+function useTtl(ms: number) {
+  config.ttlMs = ms
+  config.leadMs = Math.min(config.leadSettingMs, ms / 2)
+}
+
+// The effective TTL for what the transcript showed, unless the person forced one.
+function applyCache(cache: CacheInfo) {
+  if (config.overrideTtlMs > 0) return
+  useTtl(cache.ttl === '' ? DEFAULT_TTL_MS : TTL_MS[cache.ttl])
+}
+
+function ttlLabel(cache: CacheInfo) {
+  if (config.overrideTtlMs > 0) return `TTL ${span(config.ttlMs)} (set)`
+  return cache.ttl === '' ? 'TTL 5m (assumed)' : `TTL ${cache.ttl} (auto)`
+}
+
+type UsageRow = {
+  type?: string
+  isSidechain?: boolean
+  message?: {
+    model?: string
+    usage?: {
+      input_tokens?: number
+      cache_read_input_tokens?: number
+      cache_creation_input_tokens?: number
+      cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+    }
+  }
+}
+
+// Reads the newest main-thread responses of a session transcript: the model and
+// context size of the last one, and the TTL of the latest one that wrote cache.
+// A response that wrote any 5-minute entry counts as 5m: its tail lapses first.
+export function sampleTranscript(text: string): CacheInfo | undefined {
+  const lines = text.split('\n')
+  let found: CacheInfo | undefined
+  let seen = 0
+  for (let i = lines.length - 1; i >= 0 && seen < 400; i -= 1) {
+    const line = lines[i] ?? ''
+    if (!line.includes('"usage"')) continue
+    seen += 1
+    let row: UsageRow
+    try {
+      row = JSON.parse(line) as UsageRow
+    } catch {
+      continue
+    }
+    const usage = row.message?.usage
+    if (row.type !== 'assistant' || row.isSidechain === true || usage === undefined) continue
+    if (found === undefined) {
+      const context =
+        (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+      found = { ttl: '', model: row.message?.model ?? '', contextTokens: context }
+    }
+    const written = usage.cache_creation
+    if ((written?.ephemeral_5m_input_tokens ?? 0) > 0) return { ...found, ttl: '5m' }
+    if ((written?.ephemeral_1h_input_tokens ?? 0) > 0) return { ...found, ttl: '1h' }
+  }
+  return found
+}
+
+type Rate = { input: number; read: number }
+
+// First-party $/MTok (cached 2026-09-25). Longest matching prefix wins.
+const RATES: [string, Rate][] = [
+  ['claude-fable-5-1', { input: 10, read: 0.25 }],
+  ['claude-mythos-5-1', { input: 10, read: 0.25 }],
+  ['claude-fable-5', { input: 10, read: 1 }],
+  ['claude-mythos-5', { input: 10, read: 1 }],
+  ['claude-opus-5-5', { input: 4, read: 0.2 }],
+  ['claude-opus-5', { input: 5, read: 0.5 }],
+  ['claude-opus-4', { input: 5, read: 0.5 }],
+  ['claude-sonnet-5-5', { input: 2, read: 0.2 }],
+  ['claude-sonnet-5', { input: 2, read: 0.2 }],
+  ['claude-sonnet-4', { input: 3, read: 0.3 }],
+  ['claude-haiku-4', { input: 1, read: 0.1 }],
+]
+
+function rateOf(model: string) {
+  const id = model.replace(/^(us\.)?anthropic\./, '')
+  let best: [string, Rate] | undefined
+  for (const entry of RATES) {
+    if (id.startsWith(entry[0]) && (best === undefined || entry[0].length > best[0].length)) best = entry
+  }
+  return best?.[1]
+}
+
+function dollars(amount: number) {
+  return amount < 0.01 ? '<$0.01' : `$${amount.toFixed(2)}`
+}
+
+function thousands(tokens: number) {
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens)
+}
+
+// What one keep-alive and one cold rebuild of this context cost, as the band shows them.
+export function priceLine(cache: CacheInfo) {
+  const isHour = config.overrideTtlMs > 0 ? config.ttlMs > 300_000 : cache.ttl === '1h'
+  const writeRate = isHour ? 2 : 1.25
+  const model = cache.model.replace(/^claude-/, '') || 'model ?'
+  const head = `${ttlLabel(cache)} · ${model} · context ${thousands(cache.contextTokens)}`
+  const rate = rateOf(cache.model)
+  if (rate === undefined || cache.contextTokens === 0) {
+    return `${head} · ping ≈ one cache read · cold rebuild ${writeRate}× input`
+  }
+  const pingCost = (cache.contextTokens * rate.read) / 1e6
+  const rebuildCost = (cache.contextTokens * rate.input * writeRate) / 1e6
+  return `${head} · ping ≈ ${dollars(pingCost)} · cold rebuild ≈ ${dollars(rebuildCost)} (${writeRate}× write)`
+}
+
+async function detect($: $, transcriptPath: string) {
+  const stat = await $.fs.stat(transcriptPath)
+  if (stat.kind !== 'file' || stat.size > MAX_TRANSCRIPT_BYTES) return
+  const cache = sampleTranscript(await $.fs.read(transcriptPath))
+  if (cache === undefined) return
+  const before = config.ttlMs
+  applyCache(cache)
+  const after = config.ttlMs
+  await update($, keeper, (s): KeeperState => {
+    const isRetimed = s.phase === 'warm' && after !== before && s.idleSince > 0
+    // Re-time the countdown the last turn started under the old TTL.
+    return isRetimed ? { ...s, cache, expiresAt: s.idleSince + after } : { ...s, cache }
+  })
 }
 
 function clock(ms: number) {
@@ -254,6 +390,7 @@ type BandView = {
   next?: { label: string; left: string; tone: Tone }
   cache?: string
   progress?: number
+  price?: string
   note: string
 }
 
@@ -288,7 +425,7 @@ function bandView(s: KeeperState, now: number): BandView | undefined {
   const { leadMs, ttlMs, maxPings } = config
   const idle = known(s.idleSince) && s.phase !== 'busy' ? span(now - s.idleSince) : '-'
   const note = s.note
-  const base = { idle, steps: steps(s), note }
+  const base = { idle, steps: steps(s), note, price: s.cache.model === '' ? undefined : priceLine(s.cache) }
   const cache = s.expiresAt > now ? span(s.expiresAt - now) : 'lapsed'
 
   if (s.isOff) return { ...base, tone: 'gray', title: 'off · /cache-keeper on to resume' }
@@ -348,7 +485,8 @@ export const register: Register = (on, options) => {
     // A reload keeps the state an older version wrote and drops the old module
     // mid-action: fill in the fields it lacked and settle what it left behind.
     await update($, keeper, (saved): KeeperState => {
-      const s = { ...INITIAL, ...saved }
+      const s = { ...INITIAL, ...saved, cache: { ...INITIAL.cache, ...saved?.cache } }
+      applyCache(s.cache)
       return s.phase === 'pinging'
         ? { ...s, phase: 'warm' }
         : s.phase === 'compacting'
@@ -380,6 +518,18 @@ export const register: Register = (on, options) => {
     const s = await read($, keeper)
     if (e.agentId === undefined && e.turnId === s.turnId) await markWarm($)
     return done
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agent_id === undefined && e.transcript_path !== '') {
+      try {
+        await detect($, e.transcript_path)
+      } catch {
+        // An unreadable transcript leaves the last detection in place.
+      }
+    }
+    return result
   })
 
   on('session.compact', async ($, e, next) => {
@@ -418,6 +568,7 @@ export const register: Register = (on, options) => {
         {e.props.maxRows >= 3 && compactAt !== undefined && view.progress !== undefined && (
           <Text dimColor wrap="truncate-end">{`${bar(view.progress, width)} ${compactAt}`}</Text>
         )}
+        {e.props.maxRows >= 4 && view.price !== undefined && <Text dimColor wrap="truncate-end">{view.price}</Text>}
         {e.props.maxRows >= 3 && view.note !== '' && <Text color="yellow" wrap="truncate-end">{view.note}</Text>}
       </Box>
     )
@@ -431,9 +582,10 @@ export const register: Register = (on, options) => {
       return { text: `cache-keeper ${arg}` }
     }
     const line = describe(await read($, keeper), await $.clock.now()) ?? 'cache: no response yet'
-    const { ttlMs, leadMs, maxPings } = config
+    const s = await read($, keeper)
+    const { leadMs, maxPings } = config
     return {
-      text: `${line}\n(ttl ${ttlMs / 1000}s, ping ${leadMs / 1000}s before it lapses, ${maxPings} pings then compact)`,
+      text: `${line}\n${priceLine(s.cache)}\n(ping ${leadMs / 1000}s before it lapses, ${maxPings} pings then compact)`,
     }
   })
 }

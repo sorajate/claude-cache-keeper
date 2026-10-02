@@ -1,6 +1,9 @@
 {
   "name": "claude-cache-keeper",
-  "owner": { "name": "sorajate", "url": "https://github.com/sorajate" },
+  "owner": {
+    "name": "sorajate",
+    "url": "https://github.com/sorajate"
+  },
   "metadata": {
     "description": "Keeps Claude Code's prompt cache warm while you are away, then compacts once and waits"
   },
@@ -9,8 +12,10 @@
       "name": "cache-keeper",
       "source": "./plugins/cache-keeper",
       "description": "Countdown band for the prompt cache, keep-alive pings while idle, one auto-compact, never a second",
-      "version": "0.2.1",
-      "author": { "name": "sorajate" },
+      "version": "0.3.0",
+      "author": {
+        "name": "sorajate"
+      },
       "license": "MIT",
       "category": "productivity"
     }

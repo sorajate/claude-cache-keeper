@@ -7,6 +7,17 @@ export type KeeperPhase =
   | 'dormant'
   | 'cold'
 
+export type CacheTtl = '5m' | '1h'
+
+/** What the last main-thread request showed: read from the session transcript after each turn. */
+export type CacheInfo = {
+  /** The TTL its cache writes used; '' until a write has been seen. */
+  ttl: CacheTtl | ''
+  model: string
+  /** Prompt tokens the next request re-sends (input + cache read + cache write). */
+  contextTokens: number
+}
+
 export type KeeperState = {
   phase: KeeperPhase
   isOff: boolean
@@ -26,6 +37,7 @@ export type KeeperState = {
   idleSince: number
   /** When the running turn began. */
   activeSince: number
+  cache: CacheInfo
 }
 
 declare module 'claude-code' {

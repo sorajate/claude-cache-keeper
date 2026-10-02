@@ -1,6 +1,6 @@
 {
   "name": "cache-keeper",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Shows when the prompt cache lapses, keeps it warm with a few pings while idle, then compacts once and waits",
   "author": {
     "name": "sorajate",
@@ -19,9 +19,9 @@
   "userConfig": {
     "ttlSeconds": {
       "type": "number",
-      "title": "Cache TTL (seconds)",
-      "description": "How long the prompt cache lives after a request (Claude Code default: 300)",
-      "default": 300
+      "title": "Cache TTL override (seconds)",
+      "description": "0 (default) detects the TTL Claude Code is using from the session (5 min or 1 hour). Set a number of seconds only to force one.",
+      "default": 0
     },
     "leadSeconds": {
       "type": "number",
