@@ -31,7 +31,8 @@ const INITIAL: KeeperState = {
   note: '',
   idleSince: 0,
   activeSince: 0,
-  cache: { ttl: '', model: '', contextTokens: 0 },
+  cache: { ttl: '', model: '', contextTokens: 0, detail: '' },
+  transcriptPath: '',
 }
 
 const keeper = atom({ plugin: 'cache-keeper', key: 'keeper' } as const, INITIAL)
@@ -123,7 +124,7 @@ export function sampleTranscript(text: string): CacheInfo | undefined {
     if (found === undefined) {
       const context =
         (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
-      found = { ttl: '', model: row.message?.model ?? '', contextTokens: context }
+      found = { ttl: '', model: row.message?.model ?? '', contextTokens: context, detail: '' }
     }
     const written = usage.cache_creation
     if ((written?.ephemeral_5m_input_tokens ?? 0) > 0) return { ...found, ttl: '5m' }
@@ -181,18 +182,44 @@ export function priceLine(cache: CacheInfo) {
   return `${head} · ping ≈ ${dollars(pingCost)} · cold rebuild ≈ ${dollars(rebuildCost)} (${writeRate}× write)`
 }
 
+// Where Claude Code keeps this session's transcript, for a load before any Stop
+// event has named it: <config dir>/projects/<root, non-alphanumerics as '-'>/<id>.jsonl.
+async function guessTranscript($: $) {
+  const configured = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+  const configDir = configured ?? (home === undefined ? undefined : `${home}/.claude`)
+  if (configDir === undefined) return ''
+  const project = (await $.session.root()).replace(/[^A-Za-z0-9]/g, '-')
+  return `${configDir}/projects/${project}/${await $.session.id()}.jsonl`
+}
+
+async function noteDetail($: $, detail: string) {
+  await update($, keeper, (s): KeeperState =>
+    s.cache.model === '' ? { ...s, cache: { ...s.cache, detail } } : s,
+  )
+}
+
 async function detect($: $, transcriptPath: string) {
-  const stat = await $.fs.stat(transcriptPath)
-  if (stat.kind !== 'file' || stat.size > MAX_TRANSCRIPT_BYTES) return
-  const cache = sampleTranscript(await $.fs.read(transcriptPath))
-  if (cache === undefined) return
+  let text: string
+  try {
+    const stat = await $.fs.stat(transcriptPath)
+    if (stat.kind !== 'file') return noteDetail($, 'checked after the next reply')
+    if (stat.size > MAX_TRANSCRIPT_BYTES) return noteDetail($, 'transcript too large to read')
+    text = await $.fs.read(transcriptPath)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return noteDetail($, `transcript unreadable: ${reason.slice(0, 80)}`)
+  }
+  const cache = sampleTranscript(text)
+  if (cache === undefined) return noteDetail($, 'checked after the next reply')
   const before = config.ttlMs
   applyCache(cache)
   const after = config.ttlMs
   await update($, keeper, (s): KeeperState => {
     const isRetimed = s.phase === 'warm' && after !== before && s.idleSince > 0
     // Re-time the countdown the last turn started under the old TTL.
-    return isRetimed ? { ...s, cache, expiresAt: s.idleSince + after } : { ...s, cache }
+    const next = { ...s, cache, transcriptPath }
+    return isRetimed ? { ...next, expiresAt: s.idleSince + after } : next
   })
 }
 
@@ -425,7 +452,9 @@ function bandView(s: KeeperState, now: number): BandView | undefined {
   const { leadMs, ttlMs, maxPings } = config
   const idle = known(s.idleSince) && s.phase !== 'busy' ? span(now - s.idleSince) : '-'
   const note = s.note
-  const base = { idle, steps: steps(s), note, price: s.cache.model === '' ? undefined : priceLine(s.cache) }
+  const price =
+    s.cache.model === '' ? `${ttlLabel(s.cache)} · ${s.cache.detail || 'checked after the next reply'}` : priceLine(s.cache)
+  const base = { idle, steps: steps(s), note, price }
   const cache = s.expiresAt > now ? span(s.expiresAt - now) : 'lapsed'
 
   if (s.isOff) return { ...base, tone: 'gray', title: 'off · /cache-keeper on to resume' }
@@ -494,6 +523,14 @@ export const register: Register = (on, options) => {
           : s
     })
     $.clock.every(TICK_MS, () => void tick($))
+    // Detect at once rather than after the next reply: a reload, a resumed session.
+    try {
+      const known = (await read($, keeper)).transcriptPath
+      const path = known !== '' ? known : await guessTranscript($)
+      if (path !== '') await detect($, path)
+    } catch {
+      // No guess: the first Stop event names the transcript.
+    }
     return started
   })
 
@@ -522,13 +559,7 @@ export const register: Register = (on, options) => {
 
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
-    if (e.agent_id === undefined && e.transcript_path !== '') {
-      try {
-        await detect($, e.transcript_path)
-      } catch {
-        // An unreadable transcript leaves the last detection in place.
-      }
-    }
+    if (e.agent_id === undefined && e.transcript_path !== '') await detect($, e.transcript_path)
     return result
   })
 

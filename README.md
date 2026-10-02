@@ -15,7 +15,7 @@ TTL 1h (auto) · opus-5-5 · context 305k · ping ≈ $0.06 · cold rebuild ≈ 
 
 ## 5 minutes or 1 hour: what it costs
 
-Claude Code picks the cache TTL itself (there is no setting for it). Subscription sessions have been seen on **1 hour**, and the default API cache is **5 minutes**. After every turn the plugin reads the newest responses in the session transcript: `usage.cache_creation` splits each write into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`. A response with any 5-minute write counts as 5m, because its tail lapses first. Until a write has been seen, the plugin assumes 5m. Being wrong in that direction only costs an early ping, while assuming 1h too early would compact a cache that is about to lapse.
+Claude Code picks the cache TTL itself (there is no setting for it). Subscription sessions have been seen on **1 hour**, and the default API cache is **5 minutes**. When it loads and after every turn, the plugin reads the newest responses in the session transcript: `usage.cache_creation` splits each write into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`. A response with any 5-minute write counts as 5m, because its tail lapses first. Until a write has been seen, the plugin assumes 5m. Being wrong in that direction only costs an early ping, while assuming 1h too early would compact a cache that is about to lapse.
 
 | | 5-minute TTL | 1-hour TTL |
 | --- | --- | --- |
@@ -97,7 +97,7 @@ Tip: set `ttlSeconds` to `60` for a few minutes to watch a whole cycle quickly, 
 - Claude Code with **function-hook plugins** (built and tested on 2.1.287). That plugin API is early access and may change between releases.
 - Each ping is a real API request: it reads the cached context (about 0.1× input price) plus a tiny reply.
 - The countdown after a compaction is for information only. The compacted conversation is cached by your next request.
-- TTL detection reads the session transcript after each turn (skipped past 64 MB). If the plugin can't read it, the band keeps showing `TTL 5m (assumed)`.
+- TTL detection reads the session transcript after each turn (skipped past 64 MB). If the plugin can't read it, the band shows `TTL 5m (assumed)` and the reason.
 - Prices are a built-in table of first-party list prices. An unknown model shows multipliers instead of dollars.
 - Known gap: a long-running background **Bash** task (not an agent) does not hold the compaction yet.
 

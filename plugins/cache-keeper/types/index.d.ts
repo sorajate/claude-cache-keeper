@@ -16,6 +16,8 @@ export type CacheInfo = {
   model: string
   /** Prompt tokens the next request re-sends (input + cache read + cache write). */
   contextTokens: number
+  /** Why nothing was detected yet ('' once it was): no reply yet, or the transcript unreadable. */
+  detail: string
 }
 
 export type KeeperState = {
@@ -38,6 +40,8 @@ export type KeeperState = {
   /** When the running turn began. */
   activeSince: number
   cache: CacheInfo
+  /** The session transcript, as the last Stop event named it; '' until then. */
+  transcriptPath: string
 }
 
 declare module 'claude-code' {
